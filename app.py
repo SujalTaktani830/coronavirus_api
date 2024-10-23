@@ -2,120 +2,92 @@ import os
 import requests
 import operator
 import re
-import nltk
-from flask import Flask, render_template, request, jsonify
+import json
+from collections import Counter
+from flask import Flask, render_template, request, jsonify, abort
 from flask_sqlalchemy import SQLAlchemy
 from stop_words import get_stop_words
-from collections import Counter
 from bs4 import BeautifulSoup
-import json
 from rq import Queue
 from rq.job import Job
 from worker import conn
+import nltk
 
 app = Flask(__name__)
 app.config.from_object(os.environ['APP_SETTINGS'])
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = True
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 q = Queue(connection=conn)
 
-from models import *
+from models import Result  # Ensure this import is correct
 
+nltk.data.path.append('./nltk_data/')  # Set the NLTK data path
+
+def validate_url(url):
+    if not url.startswith(('http://', 'https://')):
+        return 'http://' + url
+    return url
+
+def count_and_save_words(url):
+    errors = []
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an error for bad responses
+    except requests.RequestException as e:
+        errors.append(str(e))
+        return {"error": errors}
+
+    # Text processing
+    raw = BeautifulSoup(response.text, 'html.parser').get_text()
+    tokens = nltk.word_tokenize(raw)
+    raw_words = [w for w in tokens if re.match(r'.*[A-Za-z].*', w)]
+    
+    raw_word_count = Counter(raw_words)
+    stops = set(get_stop_words("en"))
+    no_stop_words = [w for w in raw_words if w.lower() not in stops]
+    no_stop_words_count = Counter(no_stop_words)
+
+    # Save results
+    try:
+        result = Result(url=url, result_all=raw_word_count, result_no_stop_words=no_stop_words_count)
+        db.session.add(result)
+        db.session.commit()
+        return result.id
+    except Exception as e:
+        errors.append("Unable to add item to database: {}".format(e))
+        return {"error": errors}
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     results = {}
     if request.method == "POST":
-        # this import solves a rq bug which currently exists
-        from app import count_and_save_words
-
-        # get url that the person has entered
         url = request.form['url']
-        if not url[:8].startswith(('https://', 'http://')):
-            url = 'http://' + url
-        job = q.enqueue_call(
-            func=count_and_save_words, args=(url,), result_ttl=5000
-        )
-        print(job.get_id())
-
+        url = validate_url(url)
+        job = q.enqueue(count_and_save_words, url)
+        print(job.get_id())  # Optional: handle the job ID if needed
     return render_template('index.html', results=results)
-
 
 @app.route('/start', methods=['POST'])
 def get_counts():
-    # this import solves a rq bug which currently exists
-    from app import count_and_save_words
-
-    # get url
-    data = json.loads(request.data.decode())
-    url = data["url"]
-    if not url[:8].startswith(('https://', 'http://')):
-        url = 'http://' + url
-    # start job
-    job = q.enqueue_call(
-        func=count_and_save_words, args=(url,), result_ttl=5000
-    )
-    # return created job id
-    return job.get_id()
-
+    data = request.get_json()
+    url = validate_url(data.get("url", ""))
+    if not url:
+        abort(400, "Invalid URL provided.")
+    
+    job = q.enqueue(count_and_save_words, url)
+    return jsonify(job_id=job.get_id()), 202
 
 @app.route('/results/<job_key>', methods=['GET'])
 def get_job(job_key):
     job = Job.fetch(job_key, connection=conn)
     if job.is_finished:
         result = Result.query.filter_by(id=job.result).first()
-        results = sorted(
-            result.result_no_stop_words.items(),
-            key=operator.itemgetter(1),
-            reverse=True
-        )[:10]
+        results = sorted(result.result_no_stop_words.items(), key=operator.itemgetter(1), reverse=True)[:10]
         return jsonify(results), 200
     else:
-        return "Nay! {result}".format(result=job.is_started), 202
-
-
-def count_and_save_words(url):
-    errors = []
-
-    try:
-        r = requests.get(url)
-    except:
-        errors.append(
-            "Unable to get URL. Please make sure it's valid and try again."
-        )
-        return {"error": errors}
-
-    # text processing
-    raw = BeautifulSoup(r.text).get_text()
-    nltk.data.path.append('./nltk_data/')  # set the path
-    tokens = nltk.word_tokenize(raw)
-    text = nltk.Text(tokens)
-
-    # remove punctuation, count raw words
-    nonPunct = re.compile('.*[A-Za-z].*')
-    raw_words = [w for w in text if nonPunct.match(w)]
-    raw_word_count = Counter(raw_words)
-
-    stops = get_stop_words("en")
-    # stop words
-    no_stop_words = [w for w in raw_words if w.lower() not in stops]
-    no_stop_words_count = Counter(no_stop_words)
-
-    # save the results
-    try:
-        result = Result(
-            url=url,
-            result_all=raw_word_count,
-            result_no_stop_words=no_stop_words_count
-        )
-        db.session.add(result)
-        db.session.commit()
-        return result.id
-    except:
-        errors.append("Unable to add item to database.")
-        return {"error": errors}
-
+        return jsonify(status="Job is still running."), 202
 
 if __name__ == '__main__':
     app.run()
